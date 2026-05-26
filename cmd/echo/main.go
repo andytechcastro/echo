@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
 	"github.com/company/echo/internal/config"
 	"github.com/company/echo/internal/domain"
 	"github.com/company/echo/internal/infrastructure/detector"
+	"github.com/company/echo/internal/infrastructure/httpserver"
 	"github.com/company/echo/internal/infrastructure/mcp"
 	"github.com/company/echo/internal/infrastructure/store"
 	"github.com/company/echo/internal/setup"
@@ -36,6 +39,7 @@ func main() {
 	serveCmd.Flags().String("embedder", "vertex-ai", "Embedding provider: vertex-ai, openai, cohere")
 	serveCmd.Flags().String("log-level", "info", "Log level: debug, info, warn, error")
 	serveCmd.Flags().String("data-dir", "", "Data directory (default: ~/.config/echo)")
+	serveCmd.Flags().String("http-addr", ":7438", "HTTP server address (empty to disable)")
 
 	rootCmd.AddCommand(serveCmd)
 
@@ -109,6 +113,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	embedder, _ := cmd.Flags().GetString("embedder")
 	logLevel, _ := cmd.Flags().GetString("log-level")
 	dataDir, _ := cmd.Flags().GetString("data-dir")
+	httpAddr, _ := cmd.Flags().GetString("http-addr")
 
 	if mode != "" {
 		cfg.Mode = mode
@@ -180,11 +185,51 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Create and run MCP server.
 	mcpServer := mcp.NewServer(saveUC, searchUC, policyUC, logger)
 
+	// Create context that cancels on SIGINT/SIGTERM.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start HTTP server if address is configured.
+	if httpAddr != "" {
+		httpSrv, err := httpserver.NewServer(httpAddr, cfg.DBPath, logger)
+		if err != nil {
+			return fmt.Errorf("create HTTP server: %w", err)
+		}
+
+		go func() {
+			if err := httpSrv.Start(ctx); err != nil && err != context.Canceled {
+				logger.Error("HTTP server error", "error", err)
+				cancel()
+			}
+		}()
+
+		logger.Info("echo HTTP server starting", "addr", httpAddr)
+	}
+
+	// Handle shutdown signals.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
 	logger.Info("echo MCP server starting",
 		"mode", cfg.Mode,
 		"embedder", cfg.Embedder,
 		"data_dir", cfg.DataDir,
+		"http_addr", httpAddr,
 	)
 
-	return mcpServer.Run(context.Background())
+	// Run MCP server in a goroutine.
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- mcpServer.Run(ctx)
+	}()
+
+	// Wait for signal or error.
+	select {
+	case sig := <-sigCh:
+		logger.Info("received signal, shutting down", "signal", sig)
+		cancel()
+		return <-errCh
+	case err := <-errCh:
+		return err
+	}
 }
