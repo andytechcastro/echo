@@ -1,0 +1,19 @@
+# OpenCode local config
+.opencode/
+
+# Graphify output (generated)
+graphify-out/
+
+# Echo data
+~/.config/echo/
+
+# Binaries
+echo-mcp
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
