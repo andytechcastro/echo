@@ -4,7 +4,7 @@ This file provides context for AI agents working on the Echo codebase.
 
 ## Project Overview
 
-Echo is a shared team memory layer for AI agents. It's a Go MCP server that stores learnings in SQLite (Phase 1) with FTS5 full-text search, evolving to semantic search (Phase 2) and cloud shared memory (Phase 3).
+Echo is a shared team memory layer for AI agents. It's a Go binary that runs both an MCP server (stdio) and an HTTP server for plugin communication. Learnings are stored in SQLite with FTS5 full-text search.
 
 ## Architecture
 
@@ -14,9 +14,15 @@ Clean Architecture with dependency flow: `domain` → `usecase` → `infrastruct
 cmd/echo/main.go          → Entry point, CLI (Cobra), dependency wiring
 internal/domain/          → Interfaces (TextStore, Embedder, ProjectDetector, IdentityDetector)
 internal/usecase/         → Business logic (SaveLearning, SearchLearning, GetPolicies)
-internal/infrastructure/  → Implementations (SQLite FTS5, Git detectors, MCP server)
+internal/infrastructure/  → Implementations
+  store/                  → SQLite FTS5 storage
+  detector/               → Git project and identity detection
+  mcp/                    → MCP server and tool handlers
+  httpserver/             → HTTP server for plugin communication
+internal/sync/            → Git sync (manifest + chunk import/export)
 internal/pkg/secret/      → Secret detection patterns
 internal/config/          → Configuration management
+internal/setup/           → OpenCode plugin generation (plugin.ts embedded)
 internal/e2e/             → End-to-end integration tests
 ```
 
@@ -24,7 +30,7 @@ internal/e2e/             → End-to-end integration tests
 
 1. **Phase 1 uses SQLite FTS5 (BM25), not vector search.** We start with lexical search to validate the product before adding ML complexity. BM25 covers ~70% of developer queries.
 
-2. **Embedder interface is provider-agnostic.** It's `nil` in Phase 1, configurable in Phase 2 (Vertex AI, OpenAI, Cohere). The usecase checks `if s.embedder != nil` before generating embeddings.
+2. **Embedder interface is provider-agnostic.** It's `nil` in Phase 1, configurable in Phase 2+ (Vertex AI, OpenAI, Cohere). The usecase checks `if s.embedder != nil` before generating embeddings.
 
 3. **All data lives in `~/.config/echo/`** (XDG convention), not `~/.echo/`. Database: `~/.config/echo/echo.db`.
 
@@ -32,12 +38,17 @@ internal/e2e/             → End-to-end integration tests
 
 5. **SQLite doesn't support `[]float32` directly.** Embeddings are serialized to JSON before storing, deserialized on read.
 
+6. **Hybrid HTTP + MCP architecture (Phase 2).** The binary runs both servers. The plugin uses HTTP for lifecycle, prompt capture, and passive extraction. The MCP server is used for search/save operations.
+
+7. **Tags are strings, not arrays.** MCP clients serialize arrays inconsistently. We use `string` in input structs and `parseTags()` to handle both JSON array and comma-separated formats.
+
 ## Running Tests
 
 ```bash
-go test ./...           # All 80 tests
+go test ./...           # All 87 tests
 go test ./internal/...  # Unit + integration tests
 go test ./internal/e2e/... # End-to-end tests
+go test ./internal/infrastructure/httpserver/... # HTTP server tests
 ```
 
 ## Adding a New Feature
@@ -54,14 +65,24 @@ go test ./internal/e2e/... # End-to-end tests
 - `search_learning` — Search learnings (detects project, searches with BM25, returns ranked results)
 - `get_critical_policies` — Return always_inject learnings for the current project
 
+## HTTP Server Endpoints (Phase 2)
+
+- `GET /health` — Health check
+- `POST /sessions` — Create session (idempotent)
+- `DELETE /sessions/:id` — Delete session
+- `POST /prompts` — Capture user prompt
+- `POST /observations/passive` — Save passive observation (from Task tool output)
+- `POST /projects/migrate` — Migrate project name
+- `GET /context?project=X` — Get context for compaction
+
 ## Phase Status
 
-| Phase | Status | Storage | Embeddings |
-|-------|--------|---------|------------|
-| Phase 1 | ✅ Done | SQLite FTS5 | None (noop) |
-| Phase 2 | 🔲 Planned | SQLite + sqlite-vec | Configurable API |
-| Phase 3 | 🔲 Planned | Firestore | Same as Phase 2 |
-| Phase 4 | 🔲 Planned | Same as Phase 3 | Same as Phase 3 |
+| Phase | Status | Description |
+|-------|--------|-------------|
+| Phase 1 | ✅ Done | SQLite FTS5, MCP server, BM25 search |
+| Phase 2 | ✅ Done | HTTP server + plugin hooks + git sync + passive extraction |
+| Phase 3 | 🔲 Planned | Cloud shared memory (Firestore + kNN vector search) |
+| Phase 4 | 🔲 Planned | Admin CLI, observability, production polish |
 
 ## graphify
 
