@@ -12,6 +12,11 @@ import (
 //go:embed plugin.ts
 var pluginContent string
 
+// OpenCodeOptions configures the OpenCode setup.
+type OpenCodeOptions struct {
+	HTTPPort string
+}
+
 // OpenCodeConfig represents the structure of opencode.json.
 type OpenCodeConfig struct {
 	Plugin []string       `json:"plugin,omitempty"`
@@ -19,7 +24,7 @@ type OpenCodeConfig struct {
 }
 
 // SetupOpenCode configures OpenCode to use Echo.
-func SetupOpenCode() error {
+func SetupOpenCode(opts OpenCodeOptions) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("get home directory: %w", err)
@@ -85,12 +90,14 @@ func SetupOpenCode() error {
 
 	// 6. Add MCP entry if not present.
 	if _, exists := cfg.MCP["echo"]; !exists {
+		// Build command with HTTP port.
+		command := []string{"echo-mcp", "serve", "--http-addr", ":" + opts.HTTPPort}
 		cfg.MCP["echo"] = map[string]any{
-			"command": []string{"echo-mcp", "serve"},
+			"command": command,
 			"enabled": true,
 			"type":    "local",
 		}
-		fmt.Println("✅ Added MCP server to opencode.json")
+		fmt.Printf("✅ Added MCP server to opencode.json (HTTP port: %s)\n", opts.HTTPPort)
 	} else {
 		fmt.Println("ℹ️  MCP server already configured in opencode.json")
 	}

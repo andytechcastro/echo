@@ -16,6 +16,7 @@ import (
 	"github.com/company/echo/internal/infrastructure/httpserver"
 	"github.com/company/echo/internal/infrastructure/mcp"
 	"github.com/company/echo/internal/infrastructure/store"
+	echosync "github.com/company/echo/internal/sync"
 	"github.com/company/echo/internal/setup"
 	"github.com/company/echo/internal/usecase"
 )
@@ -92,12 +93,28 @@ func main() {
 		Short: "Configure Echo for OpenCode",
 		Long:  "Add Echo MCP server and plugin to your OpenCode configuration.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return setup.SetupOpenCode()
+			httpPort, _ := cmd.Flags().GetString("http-port")
+			return setup.SetupOpenCode(setup.OpenCodeOptions{HTTPPort: httpPort})
 		},
 	}
 
+	opencodeCmd.Flags().String("http-port", "7438", "HTTP server port for plugin communication")
+
 	setupCmd.AddCommand(opencodeCmd)
 	rootCmd.AddCommand(setupCmd)
+
+	// Sync command.
+	syncCmd := &cobra.Command{
+		Use:   "sync",
+		Short: "Sync learnings from git",
+		Long:  "Import learnings from .echo/chunks directory and update manifest.",
+		RunE:  runSync,
+	}
+
+	syncCmd.Flags().String("import", "", "Import chunks from .echo/chunks (default: current directory)")
+	syncCmd.Flags().String("data-dir", "", "Data directory (default: ~/.config/echo)")
+
+	rootCmd.AddCommand(syncCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -232,4 +249,44 @@ func runServe(cmd *cobra.Command, args []string) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func runSync(cmd *cobra.Command, args []string) error {
+	importFlag, _ := cmd.Flags().GetString("import")
+	dataDir, _ := cmd.Flags().GetString("data-dir")
+
+	// Determine project directory.
+	projectDir := "."
+	if importFlag != "" {
+		projectDir = importFlag
+	}
+
+	// Load configuration.
+	cfg := config.Load()
+	if dataDir != "" {
+		cfg.DataDir = dataDir
+		cfg.DBPath = dataDir + "/echo.db"
+	}
+
+	// Setup logger.
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	// Create store.
+	textStore, err := store.NewSQLiteFTS5Store(cfg.DBPath)
+	if err != nil {
+		return fmt.Errorf("create store: %w", err)
+	}
+	defer textStore.Close()
+
+	// Create syncer and import chunks.
+	syncer := echosync.NewSyncer(textStore, logger)
+	count, err := syncer.ImportChunks(context.Background(), projectDir)
+	if err != nil {
+		return fmt.Errorf("import chunks: %w", err)
+	}
+
+	fmt.Printf("✅ Imported %d chunks from %s/.echo/chunks\n", count, projectDir)
+	return nil
 }
