@@ -50,15 +50,34 @@ This creates a global plugin that injects Echo rules into every session and conf
 ### Start the server
 
 ```bash
-# Phase 1: Local lexical search (zero config, zero dependencies)
-echo-mcp serve
+# Mode 1: Local lexical search (zero config, zero dependencies)
+echo-mcp serve --mode local
 
-# Phase 2: Local semantic search + HTTP server (requires embedding provider credentials)
-echo-mcp serve --mode embeddings --embedder vertex-ai
+# Mode 2: Local semantic search (requires ONNX Runtime, auto-downloads 90MB model)
+echo-mcp serve --mode embeddings
 
-# Phase 3: Cloud shared memory (requires GCP credentials)
+# Mode 3: Cloud shared memory (requires GCP credentials, Phase 3b)
 echo-mcp serve --mode cloud
 ```
+
+**Using semantic search (`--mode embeddings`):**
+
+First, install ONNX Runtime:
+
+```bash
+ORT_VERSION=1.23.0
+wget https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz
+tar -xzf onnxruntime-linux-x64-${ORT_VERSION}.tgz
+sudo cp -r onnxruntime-linux-x64-${ORT_VERSION}/lib/* /usr/local/lib/
+```
+
+Then start Echo:
+
+```bash
+echo-mcp serve --mode embeddings
+```
+
+The model (all-MiniLM-L6-v2, 90MB) and tokenizer vocab are downloaded automatically on first run to `~/.config/echo/models/`.
 
 ### Sync learnings from git
 
@@ -85,10 +104,12 @@ echo-mcp admin list --scope organization
 | Env Var | Flag | Default | Description |
 |---------|------|---------|-------------|
 | `ECHO_MODE` | `--mode` | `local` | Operating mode: `local`, `embeddings`, `cloud` |
-| `ECHO_EMBEDDER` | `--embedder` | `vertex-ai` | Embedding provider: `vertex-ai`, `openai`, `cohere` |
+| `ECHO_EMBEDDER` | `--embedder` | `local` | Embedding provider: `local`, `vertex-ai`, `openai`, `cohere` |
 | `ECHO_LOG_LEVEL` | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `ECHO_DATA_DIR` | `--data-dir` | `~/.config/echo` | Data directory |
 | `ECHO_HTTP_ADDR` | `--http-addr` | `:7438` | HTTP server address (empty to disable) |
+| `ECHO_MODEL_PATH` | `--model-path` | `~/.config/echo/models/all-MiniLM-L6-v2.onnx` | ONNX model path |
+| `ECHO_VOCAB_PATH` | `--vocab-path` | `~/.config/echo/models/vocab.txt` | WordPiece vocab path |
 
 ## MCP Tools
 
@@ -110,6 +131,10 @@ Save a resolved issue, config, pattern, or decision to the team knowledge base.
 ### `search_learning`
 
 Search the team knowledge base for existing solutions.
+
+**In `embeddings` mode:** Uses semantic vector search (cosine similarity) for better results. Falls back to BM25 lexical search if vector search fails.
+
+**In `local` mode:** Uses BM25 lexical search (FTS5).
 
 **Input:**
 | Field | Type | Description |
@@ -155,7 +180,8 @@ cmd/echo/              - CLI entry point (Cobra)
 internal/
   domain/              - Core entities and interfaces (zero dependencies)
   infrastructure/
-    store/             - SQLite FTS5 storage implementation
+    store/             - SQLite FTS5 + sqlite-vec storage implementation
+    embedder/          - ONNX-based local embedding (all-MiniLM-L6-v2)
     detector/          - Git project and identity detection
     mcp/               - MCP server and tool handlers
     httpserver/        - HTTP server for plugin communication
@@ -173,21 +199,27 @@ internal/
 |-------|--------|-------------|
 | **Phase 1** | ✅ Done | Local lexical search (SQLite FTS5, zero deps, complete service) |
 | **Phase 2** | ✅ Done | HTTP server + plugin hooks + git sync + passive extraction |
-| **Phase 3** | 🔲 Planned | Cloud shared memory (Firestore + kNN vector search) |
+| **Phase 3a** | ✅ Done | Local semantic search (ONNX 90MB + sqlite-vec, 384 dims, offline) |
+| **Phase 3b** | 🔲 Planned | Cloud shared memory (Firestore kNN + external APIs) |
 | **Phase 4** | 🔲 Planned | Admin CLI, observability, production polish |
 
 ## Development
 
 ```bash
-# Run all tests
-go test ./...
+# Run all tests (requires CGO for sqlite-vec)
+CGO_ENABLED=1 go test -tags fts5 ./...
 
-# Build
-go build ./cmd/echo
+# Build (requires CGO)
+CGO_ENABLED=1 go build -tags fts5 ./cmd/echo
 
 # Run locally
-go run ./cmd/echo serve
+CGO_ENABLED=1 go run -tags fts5 ./cmd/echo serve --mode local
 ```
+
+**Requirements:**
+- Go 1.26+
+- CGO enabled (gcc/clang required)
+- ONNX Runtime shared library (for `--mode embeddings`)
 
 ## License
 

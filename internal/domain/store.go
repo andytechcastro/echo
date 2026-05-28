@@ -16,6 +16,19 @@ type SearchResult struct {
 	RelevanceScore float64
 }
 
+// VectorSearchResult represents a single result from vector search.
+// This is returned by stores that support semantic search (sqlite-vec, Firestore kNN).
+type VectorSearchResult struct {
+	LearningID string
+	Distance   float64 // cosine distance (0 = identical, 2 = opposite)
+	Project    string
+	Scope      string
+	Type       string
+	Tags       string
+	Question   string
+	Answer     string
+}
+
 // SaveInput represents the input for saving a learning.
 type SaveInput struct {
 	Project   string // auto-detected from git remote

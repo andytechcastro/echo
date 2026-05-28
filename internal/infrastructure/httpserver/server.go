@@ -12,7 +12,8 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	// CGO SQLite driver (shared with store package).
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // Server is the Echo HTTP server that runs alongside the MCP server.
@@ -28,7 +29,7 @@ type Server struct {
 
 // NewServer creates a new HTTP server.
 func NewServer(addr string, dbPath string, logger *slog.Logger) (*Server, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_busy_timeout=5000&_journal_mode=WAL")
+	db, err := sql.Open("sqlite3", dbPath+"?_busy_timeout=5000&_journal_mode=WAL")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}

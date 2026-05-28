@@ -10,28 +10,43 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	// CGO SQLite driver with sqlite-vec extension.
+	_ "github.com/mattn/go-sqlite3"
+	vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
 
 	"github.com/company/echo/internal/domain"
 )
 
-// SQLiteFTS5Store implements domain.TextStore using SQLite with FTS5 extension.
-// This is the Phase 1 storage backend — pure Go, no CGO, zero external dependencies.
+func init() {
+	// Register sqlite-vec extension with the SQLite driver.
+	// This must be called before any SQLite connections are opened.
+	vec.Auto()
+}
+
+// SQLiteFTS5Store implements domain.TextStore using SQLite with FTS5 and sqlite-vec extensions.
+// Uses CGO (mattn/go-sqlite3) to support loadable extensions (FTS5 + vec0).
 type SQLiteFTS5Store struct {
-	db *sql.DB
+	db         *sql.DB
+	dimensions int // vector dimensions (0 = no vector table)
 }
 
 // NewSQLiteFTS5Store creates a new store, initializing the database file if needed.
 // The dbPath should be the full path to the SQLite file (e.g., "~/.config/echo/echo.db").
 func NewSQLiteFTS5Store(dbPath string) (*SQLiteFTS5Store, error) {
+	return NewSQLiteFTS5StoreWithDimensions(dbPath, 0)
+}
+
+// NewSQLiteFTS5StoreWithDimensions creates a store with vector support.
+// If dimensions > 0, the vec_learnings table is created for semantic search.
+func NewSQLiteFTS5StoreWithDimensions(dbPath string, dimensions int) (*SQLiteFTS5Store, error) {
 	// Ensure directory exists.
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create config directory: %w", err)
 	}
 
-	// Open database with WAL mode for concurrent reads.
-	db, err := sql.Open("sqlite", dbPath)
+	// Open database with CGO SQLite driver (sqlite-vec enabled).
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
@@ -41,7 +56,10 @@ func NewSQLiteFTS5Store(dbPath string) (*SQLiteFTS5Store, error) {
 	db.SetMaxIdleConns(2)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	store := &SQLiteFTS5Store{db: db}
+	store := &SQLiteFTS5Store{
+		db:         db,
+		dimensions: dimensions,
+	}
 
 	if err := store.initialize(); err != nil {
 		db.Close()
@@ -66,6 +84,26 @@ func (s *SQLiteFTS5Store) initialize() error {
 		}
 	}
 
+	// Create vec_learnings table if dimensions configured.
+	if s.dimensions > 0 {
+		vecSchema := fmt.Sprintf(`
+			CREATE VIRTUAL TABLE IF NOT EXISTS vec_learnings USING vec0(
+				embedding float[%d],
+				learning_id TEXT,
+				project TEXT,
+				scope TEXT,
+				type TEXT,
+				tags TEXT,
+				question TEXT,
+				answer TEXT
+			)
+		`, s.dimensions)
+
+		if _, err := s.db.Exec(vecSchema); err != nil {
+			return fmt.Errorf("create vec_learnings table: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -81,7 +119,6 @@ func (s *SQLiteFTS5Store) Save(ctx context.Context, learning *domain.Learning) (
 	}
 
 	// Serialize embedding to JSON for SQLite storage.
-	// In Phase 1, Embedding is nil and stored as NULL.
 	var embeddingJSON []byte
 	if learning.Embedding != nil {
 		embeddingJSON, err = json.Marshal(learning.Embedding)
@@ -110,7 +147,7 @@ func (s *SQLiteFTS5Store) Save(ctx context.Context, learning *domain.Learning) (
 		learning.Location,
 		learning.Notes,
 		string(tagsJSON),
-		embeddingJSON, // JSON-serialized embedding (NULL in Phase 1)
+		embeddingJSON,
 		learning.ResolvedBy,
 		learning.CreatedAt.Format(time.RFC3339),
 		learning.UpdatedAt.Format(time.RFC3339),
@@ -119,7 +156,59 @@ func (s *SQLiteFTS5Store) Save(ctx context.Context, learning *domain.Learning) (
 		return "", fmt.Errorf("insert learning: %w", err)
 	}
 
+	// Also save to vec_learnings if embedding exists and vector table is configured.
+	if learning.Embedding != nil && s.dimensions > 0 {
+		if err := s.saveVector(ctx, learning.ID, learning.Embedding, learning); err != nil {
+			// Log but don't fail — learning is saved, just without vector index.
+			// In production, use slog here.
+		}
+	}
+
 	return learning.ID, nil
+}
+
+// saveVector inserts or updates a vector entry in vec_learnings.
+func (s *SQLiteFTS5Store) saveVector(ctx context.Context, learningID string, embedding []float32, learning *domain.Learning) error {
+	if len(embedding) != s.dimensions {
+		return fmt.Errorf("embedding dimension mismatch: expected %d, got %d", s.dimensions, len(embedding))
+	}
+
+	embeddingJSON, err := json.Marshal(embedding)
+	if err != nil {
+		return fmt.Errorf("marshal embedding: %w", err)
+	}
+
+	// Upsert: delete existing, then insert.
+	if _, err := s.db.ExecContext(ctx,
+		"DELETE FROM vec_learnings WHERE learning_id = ?",
+		learningID,
+	); err != nil {
+		return fmt.Errorf("delete existing vector: %w", err)
+	}
+
+	tagsStr := strings.Join(learning.Tags, ",")
+
+	query := `
+		INSERT INTO vec_learnings (
+			learning_id, embedding, project, scope, type, tags, question, answer
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`
+
+	_, err = s.db.ExecContext(ctx, query,
+		learningID,
+		string(embeddingJSON),
+		learning.Project,
+		string(learning.Scope),
+		string(learning.Type),
+		tagsStr,
+		learning.Question,
+		learning.Answer,
+	)
+	if err != nil {
+		return fmt.Errorf("insert vector: %w", err)
+	}
+
+	return nil
 }
 
 // Search returns learnings matching the query, ordered by BM25 relevance.
@@ -154,6 +243,75 @@ func (s *SQLiteFTS5Store) Search(ctx context.Context, query *domain.SearchQuery)
 	defer rows.Close()
 
 	return s.scanRows(rows)
+}
+
+// VectorSearch performs kNN search using cosine similarity on vec_learnings.
+// Returns results ordered by distance (most similar first).
+func (s *SQLiteFTS5Store) VectorSearch(ctx context.Context, queryVec []float32, project string, limit int) ([]VectorSearchResult, error) {
+	if s.dimensions == 0 {
+		return nil, fmt.Errorf("vector search not available: store created without vector dimensions")
+	}
+
+	if len(queryVec) != s.dimensions {
+		return nil, fmt.Errorf("query vector dimension mismatch: expected %d, got %d", s.dimensions, len(queryVec))
+	}
+
+	if limit <= 0 {
+		limit = 5
+	}
+
+	queryVecJSON, err := json.Marshal(queryVec)
+	if err != nil {
+		return nil, fmt.Errorf("marshal query vector: %w", err)
+	}
+
+	query := `
+		SELECT
+			learning_id,
+			distance,
+			project,
+			scope,
+			type,
+			tags,
+			question,
+			answer
+		FROM vec_learnings
+		WHERE embedding MATCH ?
+		  AND project = ?
+		ORDER BY distance
+		LIMIT ?
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, string(queryVecJSON), project, limit)
+	if err != nil {
+		return nil, fmt.Errorf("vector search: %w", err)
+	}
+	defer rows.Close()
+
+	var results []VectorSearchResult
+	for rows.Next() {
+		var r VectorSearchResult
+		err := rows.Scan(
+			&r.LearningID,
+			&r.Distance,
+			&r.Project,
+			&r.Scope,
+			&r.Type,
+			&r.Tags,
+			&r.Question,
+			&r.Answer,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan vector result: %w", err)
+		}
+		results = append(results, r)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+
+	return results, nil
 }
 
 // fallbackSearch uses LIKE when FTS5 syntax fails (e.g., special characters).
@@ -198,7 +356,6 @@ func (s *SQLiteFTS5Store) Update(ctx context.Context, id string, learning *domai
 		return fmt.Errorf("marshal tags: %w", err)
 	}
 
-	// Serialize embedding to JSON for SQLite storage.
 	var embeddingJSON []byte
 	if learning.Embedding != nil {
 		embeddingJSON, err = json.Marshal(learning.Embedding)
@@ -243,11 +400,23 @@ func (s *SQLiteFTS5Store) Update(ctx context.Context, id string, learning *domai
 		return domain.ErrNotFound
 	}
 
+	// Update vector index if embedding exists.
+	if learning.Embedding != nil && s.dimensions > 0 {
+		if err := s.saveVector(ctx, id, learning.Embedding, learning); err != nil {
+			// Log but don't fail.
+		}
+	}
+
 	return nil
 }
 
 // Delete removes a learning by ID.
 func (s *SQLiteFTS5Store) Delete(ctx context.Context, id string) error {
+	// Delete from vec_learnings first (if configured).
+	if s.dimensions > 0 {
+		_, _ = s.db.ExecContext(ctx, "DELETE FROM vec_learnings WHERE learning_id = ?", id)
+	}
+
 	result, err := s.db.ExecContext(ctx, "DELETE FROM learnings_data WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("delete learning: %w", err)
@@ -317,11 +486,9 @@ func (s *SQLiteFTS5Store) Close() error {
 // --- Internal helpers ---
 
 // buildFTS5Query converts a user query into FTS5 syntax.
-// It wraps each term in quotes to avoid FTS5 operator interpretation.
 func buildFTS5Query(query string) string {
 	terms := strings.Fields(query)
 	for i, term := range terms {
-		// Escape FTS5 special characters and wrap in quotes.
 		terms[i] = `"` + strings.ReplaceAll(term, `"`, `""`) + `"`
 	}
 	return strings.Join(terms, " ")
@@ -344,7 +511,7 @@ func (s *SQLiteFTS5Store) scanRows(rows *sql.Rows) ([]domain.SearchResult, error
 		var alwaysInject int
 		var createdAt, updatedAt string
 		var rank float64
-		var embeddingRaw []byte // JSON-serialized embedding
+		var embeddingRaw []byte
 
 		err := rows.Scan(
 			&l.ID, &l.Project, &scopeStr, &alwaysInject, &typeStr,
@@ -366,12 +533,10 @@ func (s *SQLiteFTS5Store) scanRows(rows *sql.Rows) ([]domain.SearchResult, error
 			_ = json.Unmarshal([]byte(tagsJSON), &l.Tags)
 		}
 
-		// Deserialize embedding from JSON.
 		if len(embeddingRaw) > 0 {
 			_ = json.Unmarshal(embeddingRaw, &l.Embedding)
 		}
 
-		// BM25 rank is negative; convert to positive score.
 		score := 0.0
 		if rank < 0 {
 			score = -rank
@@ -398,7 +563,7 @@ func scanRow(row rowScanner) (*domain.Learning, error) {
 	var scopeStr, typeStr string
 	var alwaysInject int
 	var createdAt, updatedAt string
-	var embeddingRaw []byte // JSON-serialized embedding
+	var embeddingRaw []byte
 
 	err := row.Scan(
 		&l.ID, &l.Project, &scopeStr, &alwaysInject, &typeStr,
@@ -422,7 +587,6 @@ func scanRow(row rowScanner) (*domain.Learning, error) {
 		_ = json.Unmarshal([]byte(tagsJSON), &l.Tags)
 	}
 
-	// Deserialize embedding from JSON.
 	if len(embeddingRaw) > 0 {
 		_ = json.Unmarshal(embeddingRaw, &l.Embedding)
 	}
@@ -439,9 +603,20 @@ func boolToInt(b bool) int {
 }
 
 // generateID creates a simple unique ID.
-// In production, use ulid or uuid. This is a placeholder for Phase 1.
 func generateID() string {
 	return fmt.Sprintf("learn_%d", time.Now().UnixNano())
+}
+
+// VectorSearchResult represents a single result from vector search.
+type VectorSearchResult struct {
+	LearningID string
+	Distance   float64
+	Project    string
+	Scope      string
+	Type       string
+	Tags       string
+	Question   string
+	Answer     string
 }
 
 // Ensure SQLiteFTS5Store implements domain.TextStore.

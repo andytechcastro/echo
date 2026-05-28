@@ -222,7 +222,7 @@ func TestSearchLearning_Execute_Success(t *testing.T) {
 	}
 	projDet := &mockProjectDetector{project: "github.com/test/repo"}
 
-	uc := NewSearchLearning(store, projDet)
+	uc := NewSearchLearning(store, projDet, nil)
 
 	query := &domain.SearchQuery{
 		Query: "database connection",
@@ -246,7 +246,7 @@ func TestSearchLearning_Execute_DefaultLimit(t *testing.T) {
 	store := &mockStore{}
 	projDet := &mockProjectDetector{project: "github.com/test/repo"}
 
-	uc := NewSearchLearning(store, projDet)
+	uc := NewSearchLearning(store, projDet, nil)
 
 	query := &domain.SearchQuery{
 		Query: "test",
@@ -268,7 +268,7 @@ func TestSearchLearning_Execute_EmptyQuery(t *testing.T) {
 	store := &mockStore{}
 	projDet := &mockProjectDetector{project: "github.com/test/repo"}
 
-	uc := NewSearchLearning(store, projDet)
+	uc := NewSearchLearning(store, projDet, nil)
 
 	query := &domain.SearchQuery{
 		Query: "",

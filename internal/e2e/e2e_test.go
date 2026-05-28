@@ -711,7 +711,7 @@ func TestE2E_UsecaseSaveAndSearch(t *testing.T) {
 	}
 
 	// Search via usecase.
-	searchUsecase := usecase.NewSearchLearning(env.store, env.projDet)
+	searchUsecase := usecase.NewSearchLearning(env.store, env.projDet, nil)
 	searchOutput, err := searchUsecase.Execute(context.Background(), &domain.SearchQuery{
 		Query: "N+1 query user list",
 		Limit: 5,
@@ -809,7 +809,7 @@ func TestE2E_UsecaseProjectIsolation(t *testing.T) {
 	}
 
 	// Search from project A context — should only find A's learning.
-	searchUsecaseA := usecase.NewSearchLearning(env.store, projA)
+	searchUsecaseA := usecase.NewSearchLearning(env.store, projA, nil)
 	outputA, err := searchUsecaseA.Execute(context.Background(), &domain.SearchQuery{
 		Query: "deploy",
 		Limit: 10,
@@ -824,7 +824,7 @@ func TestE2E_UsecaseProjectIsolation(t *testing.T) {
 	}
 
 	// Search from project B context — should only find B's learning.
-	searchUsecaseB := usecase.NewSearchLearning(env.store, projB)
+	searchUsecaseB := usecase.NewSearchLearning(env.store, projB, nil)
 	outputB, err := searchUsecaseB.Execute(context.Background(), &domain.SearchQuery{
 		Query: "deploy",
 		Limit: 10,

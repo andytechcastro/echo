@@ -277,7 +277,6 @@ func TestDetectError(t *testing.T) {
 		t.Errorf("Error() = %v, want %v", err.Error(), want)
 	}
 }
-}
 
 // TestMkdirAll tests that the store creates directories.
 func TestMkdirAll(t *testing.T) {

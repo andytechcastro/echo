@@ -19,9 +19,17 @@ type Config struct {
 	// Default: "local"
 	Mode string
 
-	// Embedder is the embedding provider: "vertex-ai", "openai", or "cohere".
-	// Default: "vertex-ai"
+	// Embedder is the embedding provider: "local", "vertex-ai", "openai", or "cohere".
+	// Default: "local"
 	Embedder string
+
+	// ModelPath is the path to the ONNX model file.
+	// Default: ~/.config/echo/models/all-MiniLM-L6-v2.onnx
+	ModelPath string
+
+	// VocabPath is the path to the WordPiece vocab.txt file.
+	// Default: ~/.config/echo/models/vocab.txt
+	VocabPath string
 
 	// LogLevel is the logging level: "debug", "info", "warn", "error".
 	// Default: "info"
@@ -36,13 +44,16 @@ func Default() *Config {
 	}
 
 	dataDir := filepath.Join(homeDir, ".config", "echo")
+	modelDir := filepath.Join(dataDir, "models")
 
 	return &Config{
-		DataDir:  dataDir,
-		DBPath:   filepath.Join(dataDir, "echo.db"),
-		Mode:     "local",
-		Embedder: "vertex-ai",
-		LogLevel: "info",
+		DataDir:   dataDir,
+		DBPath:    filepath.Join(dataDir, "echo.db"),
+		Mode:      "local",
+		Embedder:  "local",
+		ModelPath: filepath.Join(modelDir, "all-MiniLM-L6-v2.onnx"),
+		VocabPath: filepath.Join(modelDir, "vocab.txt"),
+		LogLevel:  "info",
 	}
 }
 
@@ -53,6 +64,9 @@ func Load() *Config {
 	if v := os.Getenv("ECHO_DATA_DIR"); v != "" {
 		cfg.DataDir = v
 		cfg.DBPath = filepath.Join(v, "echo.db")
+		modelDir := filepath.Join(v, "models")
+		cfg.ModelPath = filepath.Join(modelDir, "all-MiniLM-L6-v2.onnx")
+		cfg.VocabPath = filepath.Join(modelDir, "vocab.txt")
 	}
 
 	if v := os.Getenv("ECHO_MODE"); v != "" {
@@ -61,6 +75,14 @@ func Load() *Config {
 
 	if v := os.Getenv("ECHO_EMBEDDER"); v != "" {
 		cfg.Embedder = v
+	}
+
+	if v := os.Getenv("ECHO_MODEL_PATH"); v != "" {
+		cfg.ModelPath = v
+	}
+
+	if v := os.Getenv("ECHO_VOCAB_PATH"); v != "" {
+		cfg.VocabPath = v
 	}
 
 	if v := os.Getenv("ECHO_LOG_LEVEL"); v != "" {

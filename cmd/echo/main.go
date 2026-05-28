@@ -13,6 +13,7 @@ import (
 	"github.com/company/echo/internal/config"
 	"github.com/company/echo/internal/domain"
 	"github.com/company/echo/internal/infrastructure/detector"
+	"github.com/company/echo/internal/infrastructure/embedder"
 	"github.com/company/echo/internal/infrastructure/httpserver"
 	"github.com/company/echo/internal/infrastructure/mcp"
 	"github.com/company/echo/internal/infrastructure/store"
@@ -37,10 +38,13 @@ func main() {
 	}
 
 	serveCmd.Flags().String("mode", "local", "Operating mode: local, embeddings, cloud")
-	serveCmd.Flags().String("embedder", "vertex-ai", "Embedding provider: vertex-ai, openai, cohere")
+	serveCmd.Flags().String("embedder", "local", "Embedding provider: local, vertex-ai, openai, cohere")
 	serveCmd.Flags().String("log-level", "info", "Log level: debug, info, warn, error")
 	serveCmd.Flags().String("data-dir", "", "Data directory (default: ~/.config/echo)")
 	serveCmd.Flags().String("http-addr", ":7438", "HTTP server address (empty to disable)")
+	serveCmd.Flags().String("model-path", "", "Path to ONNX model file (default: ~/.config/echo/models/all-MiniLM-L6-v2.onnx)")
+	serveCmd.Flags().String("vocab-path", "", "Path to vocab.txt file (default: ~/.config/echo/models/vocab.txt)")
+	serveCmd.Flags().String("runtime-path", "", "Path to libonnxruntime.so (optional, searches default paths)")
 
 	rootCmd.AddCommand(serveCmd)
 
@@ -127,16 +131,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Override with flags.
 	mode, _ := cmd.Flags().GetString("mode")
-	embedder, _ := cmd.Flags().GetString("embedder")
+	embedderProvider, _ := cmd.Flags().GetString("embedder")
 	logLevel, _ := cmd.Flags().GetString("log-level")
 	dataDir, _ := cmd.Flags().GetString("data-dir")
 	httpAddr, _ := cmd.Flags().GetString("http-addr")
+	modelPath, _ := cmd.Flags().GetString("model-path")
+	vocabPath, _ := cmd.Flags().GetString("vocab-path")
+	runtimePath, _ := cmd.Flags().GetString("runtime-path")
 
 	if mode != "" {
 		cfg.Mode = mode
 	}
-	if embedder != "" {
-		cfg.Embedder = embedder
+	if embedderProvider != "" {
+		cfg.Embedder = embedderProvider
 	}
 	if logLevel != "" {
 		cfg.LogLevel = logLevel
@@ -144,6 +151,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if dataDir != "" {
 		cfg.DataDir = dataDir
 		cfg.DBPath = dataDir + "/echo.db"
+		modelDir := dataDir + "/models"
+		cfg.ModelPath = modelDir + "/all-MiniLM-L6-v2.onnx"
+		cfg.VocabPath = modelDir + "/vocab.txt"
+	}
+	if modelPath != "" {
+		cfg.ModelPath = modelPath
+	}
+	if vocabPath != "" {
+		cfg.VocabPath = vocabPath
 	}
 
 	// Setup logger.
@@ -165,38 +181,72 @@ func runServe(cmd *cobra.Command, args []string) error {
 	projDet := detector.NewGitProjectDetector("")
 	identDet := detector.NewGitIdentityDetector("")
 
-	// Create store based on mode.
-	var textStore *store.SQLiteFTS5Store
-	var err error
+	// Create embedder based on mode.
+	var embedderImpl domain.Embedder // nil in local mode
 
 	switch cfg.Mode {
-	case "local", "embeddings":
-		textStore, err = store.NewSQLiteFTS5Store(cfg.DBPath)
-		if err != nil {
-			return fmt.Errorf("create store: %w", err)
-		}
-		defer textStore.Close()
+	case "local":
+		// No embedder, BM25 only.
+		logger.Info("running in local mode (BM25 lexical search)")
 
-		// If embeddings mode, run migration.
-		if cfg.Mode == "embeddings" {
-			// Phase 2 migration: create vec_learnings table.
-			// For now, skip since we don't have sqlite-vec yet.
-			logger.Info("embeddings mode enabled (sqlite-vec migration pending)")
+	case "embeddings":
+		// Ensure model files exist (download if needed).
+		modelDir := cfg.DataDir + "/models"
+		downloadedModel, downloadedVocab, err := embedder.EnsureModel(modelDir)
+		if err != nil {
+			return fmt.Errorf("ensure model: %w", err)
 		}
+
+		// Use downloaded paths if not explicitly set.
+		effectiveModelPath := cfg.ModelPath
+		if effectiveModelPath == "" {
+			effectiveModelPath = downloadedModel
+		}
+		effectiveVocabPath := cfg.VocabPath
+		if effectiveVocabPath == "" {
+			effectiveVocabPath = downloadedVocab
+		}
+
+		// Create ONNX embedder.
+		onnxE, err := embedder.NewONNXEmbedder(effectiveModelPath, effectiveVocabPath, runtimePath)
+		if err != nil {
+			return fmt.Errorf("create ONNX embedder: %w", err)
+		}
+		defer onnxE.Close()
+		embedderImpl = onnxE
+
+		logger.Info("running in embeddings mode (semantic search)",
+			"model", effectiveModelPath,
+			"vocab", effectiveVocabPath,
+			"dimensions", onnxE.Dimensions(),
+		)
 
 	case "cloud":
-		return fmt.Errorf("cloud mode not yet implemented (Phase 3)")
+		return fmt.Errorf("cloud mode not yet implemented (Phase 3b)")
 
 	default:
 		return fmt.Errorf("unknown mode: %s", cfg.Mode)
 	}
 
-	// Embedder: nil for Phase 1, configured for Phase 2+.
-	var embedderImpl domain.Embedder // nil in Phase 1
+	// Create store with vector support if embedder is available.
+	var textStore *store.SQLiteFTS5Store
+	var err error
+
+	if embedderImpl != nil {
+		// Embeddings mode: create store with vector dimensions.
+		textStore, err = store.NewSQLiteFTS5StoreWithDimensions(cfg.DBPath, embedderImpl.Dimensions())
+	} else {
+		// Local mode: create store without vector support.
+		textStore, err = store.NewSQLiteFTS5Store(cfg.DBPath)
+	}
+	if err != nil {
+		return fmt.Errorf("create store: %w", err)
+	}
+	defer textStore.Close()
 
 	// Initialize usecases.
 	saveUC := usecase.NewSaveLearning(textStore, embedderImpl, projDet, identDet)
-	searchUC := usecase.NewSearchLearning(textStore, projDet)
+	searchUC := usecase.NewSearchLearning(textStore, projDet, embedderImpl)
 	policyUC := usecase.NewGetPolicies(textStore, projDet)
 
 	// Create and run MCP server.
